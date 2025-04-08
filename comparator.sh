@@ -59,7 +59,7 @@ compare_process_folder() {
             echo "Нет расхождений для сохранения."
         fi
 
-        # Документ совпадений
+        # Документ совпадений (в старом формате)
         if [ -n "$MATCHES" ]; then
             match_file="${folder_path}/совпадения_$(date +%Y%m%d%H%M%S).yaml"
             echo "Создание документа совпадений в $match_file..."
@@ -72,7 +72,44 @@ compare_process_folder() {
                     echo >> "$match_file"
                 fi
             done <<< "$MATCHES"
-            echo "Документ совпадений сохранен в $match_file"
+            echo "Документ совпадений (раздельный формат) сохранен в $match_file"
+            
+            # Создаем объединенный YAML манифест из совпадений
+            merged_file="${folder_path}/объединенный_манифест_$(date +%Y%m%d%H%M%S).yaml"
+            echo "Создание объединенного YAML манифеста в $merged_file..."
+            : > "$merged_file"
+            
+            # Используем yq для постепенного построения манифеста
+            temp_yaml="${folder_path}/temp.yaml"
+            : > "$temp_yaml"
+            
+            # Начинаем с пустого документа
+            echo "{}" | yq eval -o yaml > "$temp_yaml"
+            
+            while IFS= read -r path; do
+                if [ -n "$path" ]; then
+                    # Получаем значение из первого файла
+                    value=$(get_data_by_path "$data" "$path" 2>/dev/null | tail -n +2 | yq eval -o json)
+                    
+                    # Преобразуем путь в формат yq с экранированием
+                    yq_path=$(echo "$path" | 
+                              sed -E 's/([^\.\[]+)(\[[0-9]+\])?/."\1"\2/g' |
+                              sed 's/\.\././g')
+                    
+                    # Обновляем временный файл
+                    yq eval -i "$yq_path = $value" "$temp_yaml"
+                fi
+            done <<< "$MATCHES"
+            
+            # Конвертируем в красивый YAML и сохраняем
+            yq eval -P "$temp_yaml" > "$merged_file"
+            rm -f "$temp_yaml"
+            
+            echo "Объединенный YAML манифест сохранен в $merged_file"     
+            
+            # # Конвертируем JSON обратно в YAML и сохраняем
+            # echo "$merged_yaml" | yq eval -P > "$merged_file"
+            # echo "Объединенный YAML манифест сохранен в $merged_file"
         else
             echo "Нет совпадений для сохранения."
         fi
@@ -82,6 +119,7 @@ compare_process_folder() {
     rm -f "${json_files[@]}"
 }
 
+# Остальные функции остаются без изменений
 compare_json() {
     local file1=$1
     local file2=$2
@@ -157,33 +195,27 @@ compare_json() {
     echo "$matches"
 }
 
-# Функция для рекурсивного вывода ключей
 print_keys() {
     local data="$1"
     local indent="$2"
     local current_level="$3"
     local max_level="$4"
 
-    # Если текущий уровень превышает максимальный, выходим
     if [[ -n "$max_level" && "$current_level" -ge "$max_level" ]]; then
         return
     fi
 
-    # Получаем ключи текущего уровня
     keys=$(echo "$data" | yq eval 'keys | .[]' -)
 
     for key in $keys; do
         echo "${indent}${key}"
 
-        # Получаем значение текущего ключа
         value=$(echo "$data" | yq eval ".\"$key\"" -)
 
-        # Если значение является map (вложенный словарь), рекурсивно обрабатываем его
         if echo "$value" | yq eval 'tag == "!!map"' - | grep -q "true"; then
             print_keys "$value" "$indent  " "$((current_level + 1))" "$max_level"
         fi
 
-        # Если значение является массивом, обрабатываем каждый элемент
         if echo "$value" | yq eval 'tag == "!!seq"' - | grep -q "true"; then
             echo "$value" | yq eval '.[] | select(tag == "!!map")' - | while read -r item; do
                 print_keys "$item" "$indent  " "$((current_level + 1))" "$max_level"
@@ -192,19 +224,15 @@ print_keys() {
     done
 }
 
-# Функция для извлечения данных по пути
 get_data_by_path() {
     local data="$1"
     local path="$2"
     local result
 
-    # Разбиваем путь на компоненты, учитывая массивы
     IFS='.' read -r -a path_components <<< "$path"
 
-    # Последовательно извлекаем данные
     result="$data"
     for component in "${path_components[@]}"; do
-        # Проверяем, является ли компонент массивом с индексом
         if [[ "$component" =~ ^([^[]+)\[([0-9]+)\]$ ]]; then
             key="${BASH_REMATCH[1]}"
             index="${BASH_REMATCH[2]}"
@@ -219,14 +247,12 @@ get_data_by_path() {
         fi
     done
 
-    # Возвращаем только последний ключ и его значение
    cleaned_component=$(echo "${path_components[-1]}" | sed -E 's/\[[0-9]+\]//g')
     echo "$cleaned_component:"
     echo "$result" | yq eval -o=json | yq eval -P | sed 's/^/  /'
     return 0
 }
 
-# Функция для сохранения данных в файл
 save_to_file() {
     local data="$1"
     local default_name="$2"
@@ -236,7 +262,6 @@ save_to_file() {
         read -p "Введите имя файла (по умолчанию: $default_name): " file_name
         file_name="${file_name:-$default_name}"
 
-        # Сохраняем данные в файл
         echo "$data" > "$file_name.yaml"
         echo "Результат сохранен в файл: $file_name"
     else
@@ -249,7 +274,6 @@ process_folder() {
 
     yaml_files=("$folder_path"/*.yaml)
 
-    # Выводим список файлов
     echo "____________________________________"
     echo "Список файлов:"
     for i in "${!yaml_files[@]}"; do
@@ -257,10 +281,8 @@ process_folder() {
     done
     echo
 
-    # Запрашиваем уровень вложенности
     read -p "Введите уровень вложенности (оставьте пустым для вывода всех ключей): " max_level
 
-    # Обрабатываем все файлы и собираем ключи
     all_keys=""
     for selected_file in "${yaml_files[@]}"; do
         echo "Обрабатывается файл: $selected_file"
@@ -270,12 +292,9 @@ process_folder() {
     done
 
     echo "____________________________________"
-
-    # Выводим все ключи
     echo -e "$all_keys"
 
     while true; do
-        # Спрашиваем пользователя, что он хочет сделать
         echo "Что вы хотите сделать с ключами?"
         echo "1. Показать только выбранные ключи"
         echo "2. Удалить выбранные ключи и показать оставшийся манифест"
@@ -286,12 +305,10 @@ process_folder() {
             continue
         fi
 
-        # Запрашиваем ключи для работы
         read -p "Введите ключи для работы (через пробел): " selected_keys
 
         case $action in
             1)
-                # Показываем только выбранные ключи
                 echo
                 for selected_file in "${yaml_files[@]}"; do
                     data=$(cat "$selected_file")
@@ -307,7 +324,6 @@ process_folder() {
                     echo
                 done
 
-                # Предлагаем сохранить результат
                 save_to_file "$(for selected_file in "${yaml_files[@]}"; do
                     data=$(cat "$selected_file")
                     echo "#Файл: $selected_file"
@@ -321,14 +337,11 @@ process_folder() {
                 done)" "selected_keys.yaml"
                 ;;
             2)
-                # Удаляем выбранные ключи
                 for selected_file in "${yaml_files[@]}"; do
                     data=$(cat "$selected_file")
                     filtered_data="$data"
                     for key in $selected_keys; do
-                        # Экранируем ключ для yq
                         key_escaped=$(echo "$key" | sed 's/\./\\./g')
-                        # Удаляем ключ по полному пути
                         filtered_data=$(echo "$filtered_data" | yq eval "del(.\"$key_escaped\")" -)
                     done
                     echo "Отфильтрованный манифест для файла $selected_file:"
@@ -336,13 +349,11 @@ process_folder() {
                     echo "$filtered_data"
                     echo
 
-                    # Предлагаем сохранить результат
                     save_to_file "$filtered_data" "filtered_manifest_$(basename "$selected_file")"
                 done
                 ;;
         esac
 
-        # Спрашиваем, хочет ли пользователь продолжить
         read -p "Хотите продолжить работу с ключами? (y/n): " continue_choice
         if [[ "$continue_choice" != "y" && "$continue_choice" != "Y" ]]; then
             break
@@ -350,7 +361,6 @@ process_folder() {
     done
 }
 
-# Проверяем, передан ли путь к папке
 if [ "$#" -ne 1 ]; then
     echo "Использование: $0 <путь_к_папке>"
     exit 1
@@ -385,5 +395,4 @@ main_menu() {
     done
 }
 
-# Запуск основного меню
 main_menu "$1"
